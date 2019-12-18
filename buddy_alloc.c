@@ -11,7 +11,8 @@
 #include <string.h>
 #include <strings.h>
 
-#define MAX_BUDDY_ENTRIES						(1024)
+#include "list.h"
+
 #define msg_err(msg, ...)						\
 	printf("[ERR]: " msg "\n", ##__VA_ARGS__)
 #define msg_info(msg, ...)						\
@@ -31,17 +32,17 @@ struct prog_args_t {
 struct buddy_entry_t {
 	unsigned int start_addr;
 	int order;
-	int idx;
 	bool is_used;
 	struct buddy_entry_t *buddy;
 	struct buddy_entry_t *parent;
+	struct list_head_t link;
 };
 
 struct buddy_list_t {
 	int used_count;
 	int free_count;
-	struct buddy_entry_t *used_entries[MAX_BUDDY_ENTRIES];
-	struct buddy_entry_t *free_entries[MAX_BUDDY_ENTRIES];
+	struct list_head_t used_entries;
+	struct list_head_t free_entries;
 };
 
 struct buddy_allocator_t {
@@ -67,25 +68,45 @@ static const struct option long_options[] = {
 static const char *option_str = "hvo:p:s:l:a:n:";
 static struct prog_args_t prog_args;
 
-static void buddy_add_entry(struct buddy_allocator_t *allocator,
+static void buddy_add_free_entry(struct buddy_allocator_t *allocator,
 		struct buddy_entry_t *entry)
 {
 	struct buddy_list_t *buddy_list = &allocator->buddy_list[entry->order];
 
+	if (entry->is_used) {
+		list_del(&entry->link);
+		buddy_list->used_count--;
+	}
 	entry->is_used = false;
-	entry->idx = buddy_list->free_count;
-	buddy_list->free_entries[buddy_list->free_count++] = entry;
+	list_add(&entry->link, &buddy_list->free_entries);
+	buddy_list->free_count++;
 }
 
-static void buddy_remove_entry(struct buddy_allocator_t *allocator,
+static void buddy_remove_free_entry(struct buddy_allocator_t *allocator,
 		struct buddy_entry_t *entry)
 {
 	struct buddy_list_t *buddy_list = &allocator->buddy_list[entry->order];
 
-	buddy_list->free_count--;
 	entry->is_used = true;
-	entry->idx = buddy_list->used_count;
-	buddy_list->used_entries[buddy_list->used_count++] = entry;
+
+	list_del(&entry->link);
+	buddy_list->free_count--;
+	list_add(&entry->link, &buddy_list->used_entries);
+	buddy_list->used_count++;
+}
+
+static void buddy_recycle_entry(struct buddy_allocator_t *allocator,
+		struct buddy_entry_t *entry)
+{
+	struct buddy_list_t *buddy_list = &allocator->buddy_list[entry->order];
+
+	list_del(&entry->link);
+	list_del(&entry->buddy->link);
+	(entry->is_used) ? buddy_list->used_count-- : buddy_list->free_count--;
+	(entry->buddy->is_used) ? buddy_list->used_count-- : buddy_list->free_count--;
+
+	free(entry);
+	free(entry->buddy);
 }
 
 static int buddy_allocator_init(struct buddy_allocator_t *allocator)
@@ -100,15 +121,14 @@ static int buddy_allocator_init(struct buddy_allocator_t *allocator)
 	first_entry->order = allocator->max_order;
 	first_entry->buddy = NULL;
 	first_entry->parent = NULL;
+	first_entry->is_used = false;
 	for (int i = 0; i <= allocator->max_order; i++) {
 		allocator->buddy_list[i].free_count = 0;
 		allocator->buddy_list[i].used_count = 0;
-		memset(allocator->buddy_list[i].free_entries, 0,
-				sizeof(allocator->buddy_list[i].free_entries));
-		memset(allocator->buddy_list[i].used_entries, 0,
-				sizeof(allocator->buddy_list[i].used_entries));
+		INIT_LIST_HEAD(&allocator->buddy_list[i].free_entries);
+		INIT_LIST_HEAD(&allocator->buddy_list[i].used_entries);
 	}
-	buddy_add_entry(allocator, first_entry);
+	buddy_add_free_entry(allocator, first_entry);
 
 	return 0;
 }
@@ -126,7 +146,9 @@ static struct buddy_entry_t* buddy_split_entry(struct buddy_allocator_t *allocat
 		new_entry[i]->start_addr = entry->start_addr + i * buddy_size;
 		new_entry[i]->order = new_order;
 		new_entry[i]->parent = entry;
-		buddy_add_entry(allocator, new_entry[i]);
+		INIT_LIST_HEAD(&new_entry[i]->link);
+		new_entry[i]->is_used = false;
+		buddy_add_free_entry(allocator, new_entry[i]);
 	}
 	new_entry[0]->buddy = new_entry[1];
 	new_entry[1]->buddy = new_entry[0];
@@ -144,14 +166,14 @@ static struct buddy_entry_t* buddy_alloc_internal(struct buddy_allocator_t *allo
 	}
 
 	if (buddy_list->free_count > 0) {
-		buddy_entry = buddy_list->free_entries[buddy_list->free_count - 1];
-		buddy_remove_entry(allocator, buddy_entry);
-		buddy_entry->is_used = true;
+		buddy_entry = container_of(buddy_list->free_entries.next,
+				struct buddy_entry_t, link);
+		buddy_remove_free_entry(allocator, buddy_entry);
 	} else {
 		buddy_entry = buddy_alloc_internal(allocator, order + 1);
 		if (buddy_entry != NULL) {
 			buddy_entry = buddy_split_entry(allocator, buddy_entry);
-			buddy_remove_entry(allocator, buddy_entry);
+			buddy_remove_free_entry(allocator, buddy_entry);
 		}
 	}
 
@@ -161,30 +183,20 @@ static struct buddy_entry_t* buddy_alloc_internal(struct buddy_allocator_t *allo
 static void buddy_free_internal(struct buddy_allocator_t *allocator, struct buddy_entry_t *entry)
 {
 	struct buddy_entry_t *buddy = entry->buddy;
+	struct buddy_entry_t *parent = entry->parent;
 	struct buddy_list_t *buddy_list = &allocator->buddy_list[entry->order];
-
-
-	for (int i = entry->idx; i < buddy_list->used_count - 1; i++) {
-			buddy_list->used_entries[i] = buddy_list->used_entries[i + 1];
-	}
-	buddy_list->used_count--;
 
 	if (buddy) {
 		if (buddy->is_used) {
-			buddy_add_entry(allocator, entry);
+			buddy_add_free_entry(allocator, entry);
 		} else {
-			for (int i =  entry->idx; i < buddy_list->free_count - 1; i++) {
-				buddy_list->free_entries[i] = buddy_list->free_entries[i + 1];
-			}
-			buddy_list->free_count--;
-			free(buddy);
-			free(entry);
-			if (entry->parent != NULL) {
-				buddy_free_internal(allocator, entry->parent);
+			buddy_recycle_entry(allocator, entry);
+			if (parent != NULL) {
+				buddy_free_internal(allocator, parent);
 			}
 		}
 	} else {
-		buddy_add_entry(allocator, entry);
+		buddy_add_free_entry(allocator, entry);
 	}
 }
 
@@ -331,7 +343,6 @@ int main(int argc, char *argv[])
 	msg_info("buddy allocator initialized");
 	msg_info("max_order(%d), page_size(%d), start_addr(0x%x)",
 			alloc.max_order, alloc.page_size, alloc.start_addr);
-	buddy_print_statistics(&alloc);
 	alloc_entries = (struct buddy_entry_t **)calloc(sizeof(*alloc_entries),
 			prog_args.alloc_loop * prog_args.sub_loop);
 	for (int i = 0; i < prog_args.alloc_loop; i++) {
@@ -340,7 +351,7 @@ int main(int argc, char *argv[])
 		for (int j = 0; j < prog_args.sub_loop; j++) {
 			alloc_entries[count] = buddy_alloc(&alloc, size);
 			if(alloc_entries[count] == NULL) {
-				msg_err("allocation(%d) failed", i);
+				msg_err("allocation(%d) failed", count);
 			}
 			count++;
 		}
