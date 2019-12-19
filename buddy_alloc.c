@@ -358,7 +358,7 @@ int main(int argc, char *argv[])
 	}
 	buddy_print_statistics(&alloc);
 	msg_info("made %d allocations", count);
-	for (int i = count; i >= 0; i--) {
+	for (int i = 0; i < count; i++) {
 		if (alloc_entries[i] != NULL) {
 			buddy_free(&alloc, alloc_entries[i]);
 		}
